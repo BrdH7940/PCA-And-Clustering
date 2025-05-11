@@ -1,4 +1,4 @@
-from Utils import *
+from Utils.Utils import *
 class MyGMM:
     def __init__(self, n_components=2, max_iter=100, tol=1e-4, random_state=None):
         # Khởi tạo tham số

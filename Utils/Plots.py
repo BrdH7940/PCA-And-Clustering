@@ -1,5 +1,5 @@
-from Utils import *
-from KMeans import MyKMeans
+from Utils.Utils import *
+from ClusteringAlgorithm.KMeans import MyKMeans
 from PCA import MyPCA
 
 def plot_explained_variance_ratio(pca, component_ax_kwargs=None, cumulative_ax_kwargs=None, customizations=None, legend_location=(0.85, 0.7)):

@@ -1,4 +1,4 @@
-from Utils import *
+from Utils.Utils import *
 
 class MyKMeans:
     def __init__(self, n_clusters=2, n_init=10, max_iter=300, tol=1e-4, random_state=None, track_history=False):
