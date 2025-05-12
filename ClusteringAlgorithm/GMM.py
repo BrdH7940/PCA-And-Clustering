@@ -1,4 +1,5 @@
-from Utils.Utils import *
+import numpy as np
+
 class MyGMM:
     def __init__(self, n_components=2, max_iter=100, tol=1e-4, random_state=None):
         # Khởi tạo tham số
@@ -59,18 +60,23 @@ class MyGMM:
             self.covariances_[k] += 1e-6 * np.eye(n_features)
 
     def _gaussian(self, X, mean, cov):
-        # Tính giá trị phân phối Gaussian đa biến
-        n = X.shape[1]
-        diff = X - mean
-        inv_cov = np.linalg.inv(cov)
-        det_cov = np.linalg.det(cov)
-        
-        # Hệ số chuẩn hóa
-        norm = 1.0 / np.sqrt((2 * np.pi) ** n * det_cov)
-        
-        # Tính phần mũ (exponential) trong công thức Gaussian
-        exp = np.exp(-0.5 * np.sum(diff @ inv_cov * diff, axis=1))
-        return norm * exp
+        # Add try-except to handle numerical instability
+        try:
+            n = X.shape[1]
+            diff = X - mean
+            inv_cov = np.linalg.inv(cov)
+            det_cov = np.linalg.det(cov)
+
+            # Check for very small determinant
+            if det_cov < 1e-15:
+                raise np.linalg.LinAlgError("Singular covariance matrix")
+
+            norm = 1.0 / np.sqrt((2 * np.pi) ** n * det_cov)
+            exp = np.exp(-0.5 * np.sum(diff @ inv_cov * diff, axis=1))
+            return norm * exp
+        except np.linalg.LinAlgError:
+            # Return very small probability if numerical issues occur
+            return np.ones(X.shape[0]) * 1e-300
 
     def fit(self, X):
         # Huấn luyện mô hình GMM

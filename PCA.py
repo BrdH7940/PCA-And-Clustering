@@ -1,4 +1,4 @@
-from Utils import *
+import numpy as np
 
 class MyPCA:
     def __init__(self, n_components: int) -> None:
@@ -19,7 +19,7 @@ class MyPCA:
         S = X_centered.T @ X_centered / X_centered.shape[0]
 
         # Tính trị riêng và vector riêng
-        eigenvalues, eigenvectors = np.linalg.eig(S)
+        eigenvalues, eigenvectors = np.linalg.eigh(S)
 
         # Sắp xếp theo trị riêng giảm dần
         idx = np.argsort(eigenvalues)[::-1]
