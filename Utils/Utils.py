@@ -8,6 +8,21 @@ from ClusteringAlgorithm.KMeans import MyKMeans
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, Subset
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import accuracy_score, f1_score
+from scipy.optimize import linear_sum_assignment
+import warnings
+from scipy.optimize import linear_sum_assignment
+from torch.utils.data import DataLoader, TensorDataset
+import pickle
+import json
+
+warnings.filterwarnings("ignore")
 
 def transform_features(data_path, output_path=None, skew_threshold=1.0,
                        poly_degree=2, poly_threshold=0.1,
@@ -570,3 +585,617 @@ def run_multi_threshold_experiment(dataset_path, output_dir='./',
         print(f"Silhouette Score: {config['silhouette_score']:.4f}")
 
     return experiment_dir, combined_results
+
+# 1-layer KAN Encoder
+class KANEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256):
+        super().__init__()
+        self.weights = nn.Parameter(torch.randn(input_dim, hidden_dim) * 0.4)
+        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        self.a = nn.Parameter(torch.ones(hidden_dim))
+        self.b = nn.Parameter(torch.zeros(hidden_dim))
+        self.c = nn.Parameter(torch.ones(hidden_dim))
+        self.d = nn.Parameter(torch.zeros(hidden_dim))
+
+    def kan_activation(self, x):
+        return self.a * torch.tanh(self.b * x + self.c) + self.d
+
+    def forward(self, x):
+        x = F.linear(x, self.weights.T, self.bias)
+        x = x + torch.rand_like(x) * 0.2
+        return self.kan_activation(x)
+
+# 1-layer Tanh Decoder
+class TanhDecoder(nn.Module):
+    def __init__(self, hidden_dim, output_dim):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, output_dim)
+        self.activation = nn.Tanh()
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.activation(x)
+        x = x + torch.rand_like(x) * 0.2
+        return x
+
+# Autoencoder
+class AdversarialAutoencoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256, noise_factor=0.1):
+        super().__init__()
+        self.encoder = KANEncoder(input_dim, hidden_dim)
+        self.decoder = TanhDecoder(hidden_dim, input_dim)
+        self.noise_factor = noise_factor
+
+    def forward(self, x, add_noise=True):
+        if add_noise:
+            x_noisy = x + self.noise_factor * torch.randn_like(x)
+        else:
+            x_noisy = x
+        encoded = self.encoder(x_noisy)
+        decoded = self.decoder(encoded)
+        return encoded, decoded
+
+# Linear Classifier - FIXED
+class LinearClassifier(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        return self.fc(x).squeeze(-1)
+
+def train_autoencoder(model, loader, optimizer_enc, optimizer_dec, device):
+    model.train()
+    total_loss = 0
+    for data, _ in loader:
+        optimizer_enc.zero_grad()
+        optimizer_dec.zero_grad()
+        data = data.to(device)
+        _, decoded = model(data)
+        loss = F.mse_loss(decoded, data)
+        loss.backward()
+        optimizer_enc.step()
+        optimizer_dec.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+# FIXED: Use BCEWithLogitsLoss instead of BCELoss
+def train_classifier(encoder, classifier, loader, optimizer, device):
+    encoder.eval()
+    classifier.train()
+    total_loss = 0
+    # Changed from BCELoss to BCEWithLogitsLoss
+    bce_with_logits = nn.BCEWithLogitsLoss()
+
+    for data, labels in loader:
+        data, labels = data.to(device), labels.to(device)
+        optimizer.zero_grad()
+        with torch.no_grad():
+            embeddings = encoder(data)
+        logits = classifier(embeddings)
+
+        # BCEWithLogitsLoss applies sigmoid internally, so we don't need to
+        loss = bce_with_logits(logits, labels.float())
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+def pseudo_label_dataset(encoder, dataset, device, n_clusters=2):
+    loader = DataLoader(dataset, batch_size=256)
+    encoder.eval()
+    embeddings = []
+    with torch.no_grad():
+        for data, _ in loader:
+            data = data.to(device)
+            emb = encoder(data)
+            embeddings.append(emb.cpu().numpy())
+    embeddings = np.vstack(embeddings)
+    pca = MyPCA(n_components=2)
+    embeddings = pca.fit_transform(embeddings)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    cluster_labels = kmeans.fit_predict(embeddings)
+    return cluster_labels
+
+# Additional debugging function
+def check_tensor_validity(tensor, name):
+    """Check if tensor contains NaN or Inf values"""
+    if torch.isnan(tensor).any():
+        print(f"Warning: {name} contains NaN values")
+        return False
+    if torch.isinf(tensor).any():
+        print(f"Warning: {name} contains Inf values")
+        return False
+    return True
+
+# Training loop with additional error checking
+def safe_train_classifier(encoder, classifier, loader, optimizer, device):
+    encoder.eval()
+    classifier.train()
+    total_loss = 0
+    bce_with_logits = nn.BCEWithLogitsLoss()
+
+    for batch_idx, (data, labels) in enumerate(loader):
+        data, labels = data.to(device), labels.to(device)
+
+        # Check input validity
+        if not check_tensor_validity(data, f"batch_{batch_idx}_data"):
+            continue
+        if not check_tensor_validity(labels, f"batch_{batch_idx}_labels"):
+            continue
+
+        optimizer.zero_grad()
+        with torch.no_grad():
+            embeddings = encoder(data)
+            if not check_tensor_validity(embeddings, f"batch_{batch_idx}_embeddings"):
+                continue
+
+        logits = classifier(embeddings)
+        if not check_tensor_validity(logits, f"batch_{batch_idx}_logits"):
+            continue
+
+        loss = bce_with_logits(logits, labels.float())
+        if not check_tensor_validity(loss, f"batch_{batch_idx}_loss"):
+            continue
+
+        loss.backward()
+
+        # Gradient clipping to prevent gradient explosion
+        torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=1.0)
+
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader) if len(loader) > 0 else 0
+
+def best_map(y_true, y_pred):
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    D = max(y_pred.max(), y_true.max()) + 1
+    w = np.zeros((D, D), dtype=np.int64)
+    for i in range(y_pred.size):
+        w[y_pred[i], y_true[i]] += 1
+    ind = linear_sum_assignment(w.max() - w)
+    return {j: i for i, j in zip(*ind)}
+
+def train_kan_autoencoder(X, y,
+                         # Model parameters
+                         hidden_dim=256,
+                         noise_factor=0.1,
+
+                         # Training parameters
+                         n_warmup=70,
+                         n_cycles=50,
+                         unsup_epochs=15,
+                         sup_epochs=25,
+                         batch_size=128,
+
+                         # Optimization parameters
+                         lr_encoder=0.0024,
+                         lr_decoder=0.001,
+                         lr_classifier=0.001,
+
+                         # Semi-supervised parameters
+                         n_clusters=2,
+                         sup_ratio=0.25,  # fraction of data used for supervised training
+
+                         # Other parameters
+                         device=None,
+                         save_dir='./saved_models',
+                         experiment_name=None,
+                         save_best=True,
+                         plot_loss=True,
+                         verbose=True,
+                         random_seed=42):
+    """
+    Train KAN Autoencoder with semi-supervised learning
+
+    Parameters:
+    -----------
+    X : array-like, shape (n_samples, n_features)
+        Input features
+    y : array-like, shape (n_samples,)
+        Target labels (for evaluation, not used in training)
+    hidden_dim : int
+        Dimension of the hidden representation
+    noise_factor : float
+        Noise factor for denoising autoencoder
+    n_warmup : int
+        Number of warmup epochs (unsupervised only)
+    n_cycles : int
+        Number of alternating cycles
+    unsup_epochs : int
+        Number of unsupervised epochs per cycle
+    sup_epochs : int
+        Number of supervised epochs per cycle
+    batch_size : int
+        Batch size for training
+    lr_encoder, lr_decoder, lr_classifier : float
+        Learning rates
+    n_clusters : int
+        Number of clusters for pseudo-labeling
+    sup_ratio : float
+        Ratio of data used for supervised training
+    device : str or None
+        Device to use ('cuda' or 'cpu')
+    save_dir : str
+        Directory to save models
+    experiment_name : str or None
+        Name for the experiment
+    save_best : bool
+        Whether to save the best model
+    plot_loss : bool
+        Whether to plot training losses
+    verbose : bool
+        Whether to print training progress
+    random_seed : int
+        Random seed for reproducibility
+
+    Returns:
+    --------
+    dict : Training results including model, history, and best metrics
+    """
+
+    # Set random seeds
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+
+    # Setup device
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device)
+
+    # Setup experiment directory
+    if experiment_name is None:
+        experiment_name = datetime.now().strftime("kan_autoencoder_%Y%m%d_%H%M%S")
+
+    exp_dir = os.path.join(save_dir, experiment_name)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    # Preprocess data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Create tensors and dataset
+    X_tensor = torch.FloatTensor(X_scaled)
+    y_tensor = torch.FloatTensor(y)
+    dataset = TensorDataset(X_tensor, y_tensor)
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize model
+    input_dim = X.shape[1]
+    model = AdversarialAutoencoder(input_dim, hidden_dim, noise_factor).to(device)
+
+    # Initialize optimizers
+    optimizer_enc = torch.optim.Adam(model.encoder.parameters(), lr=lr_encoder)
+    optimizer_dec = torch.optim.Adam(model.decoder.parameters(), lr=lr_decoder)
+
+    # Training history
+    history = {
+        'losses': [],
+        'cycle_accuracies': [],
+        'cycle_f1_scores': [],
+        'best_accuracy': 0.0,
+        'best_f1': 0.0,
+        'best_cycle': 0
+    }
+
+    # Best model state
+    best_model_state = None
+
+    if verbose:
+        print(f"Starting training with {n_warmup} warmup epochs and {n_cycles} cycles")
+        print(f"Input dim: {input_dim}, Hidden dim: {hidden_dim}")
+        print(f"Device: {device}")
+
+    # Phase 1: Warmup (Unsupervised training)
+    if verbose:
+        print("\n=== Warmup Phase ===")
+
+    for epoch in range(n_warmup):
+        loss = train_autoencoder(model, train_loader, optimizer_enc, optimizer_dec, device)
+        history['losses'].append(loss)
+
+        if verbose and (epoch + 1) % 10 == 0:
+            print(f'Warmup Epoch {epoch+1}/{n_warmup}, Loss: {loss:.4f}')
+
+    # Phase 2: Alternating unsupervised and semi-supervised training
+    if verbose:
+        print("\n=== Alternating Phase ===")
+
+    for cycle in range(n_cycles):
+        # Unsupervised phase
+        for epoch in range(unsup_epochs):
+            loss = train_autoencoder(model, train_loader, optimizer_enc, optimizer_dec, device)
+            history['losses'].append(loss)
+
+        # Pseudo-labeling
+        classifier = LinearClassifier(hidden_dim).to(device)
+        cluster_labels = pseudo_label_dataset(model.encoder, dataset, device, n_clusters)
+
+        # Create supervised dataset
+        indices = np.arange(len(dataset))
+        np.random.shuffle(indices)
+        sup_indices = indices[:int(len(indices) * sup_ratio)]
+        sup_labels = cluster_labels[sup_indices]
+        sup_X = X_tensor[sup_indices]
+        sup_y = torch.FloatTensor(sup_labels)
+        sup_dataset = TensorDataset(sup_X, sup_y)
+        sup_loader = DataLoader(sup_dataset, batch_size=batch_size, shuffle=True)
+
+        # Supervised phase
+        optimizer_cls = torch.optim.Adam(classifier.parameters(), lr=lr_classifier)
+        for epoch in range(sup_epochs):
+            loss = safe_train_classifier(model.encoder, classifier, sup_loader, optimizer_cls, device)
+
+        # Evaluate current cycle
+        classifier.eval()
+        with torch.no_grad():
+            all_embeddings = model.encoder(X_tensor.to(device))
+            logits = classifier(all_embeddings)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).cpu().numpy().astype(int)
+            true_labels = y_tensor.cpu().numpy().astype(int)
+            acc = accuracy_score(true_labels, preds)
+            f1 = f1_score(true_labels, preds, average='weighted')
+
+        history['cycle_accuracies'].append(acc)
+        history['cycle_f1_scores'].append(f1)
+
+        # Update best model
+        if acc > history['best_accuracy']:
+            history['best_accuracy'] = acc
+            history['best_f1'] = f1
+            history['best_cycle'] = cycle
+
+            # Save best model state
+            if save_best:
+                best_model_state = {
+                    'model_state_dict': model.state_dict(),
+                    'classifier_state_dict': classifier.state_dict(),
+                    'scaler': scaler,
+                    'accuracy': acc,
+                    'f1_score': f1,
+                    'cycle': cycle,
+                    'hyperparameters': {
+                        'hidden_dim': hidden_dim,
+                        'noise_factor': noise_factor,
+                        'n_warmup': n_warmup,
+                        'n_cycles': n_cycles,
+                        'lr_encoder': lr_encoder,
+                        'lr_decoder': lr_decoder,
+                        'lr_classifier': lr_classifier,
+                        'batch_size': batch_size,
+                        'sup_ratio': sup_ratio,
+                        'n_clusters': n_clusters
+                    }
+                }
+
+        if verbose and (cycle + 1) % 5 == 0:
+            print(f'Cycle {cycle+1}/{n_cycles} - Accuracy: {acc:.4f}, F1: {f1:.4f}')
+
+    # Final evaluation with clustering
+    if verbose:
+        print("\n=== Final Evaluation ===")
+
+    model.eval()
+    with torch.no_grad():
+        embeddings = model.encoder(X_tensor.to(device)).cpu().numpy()
+
+    # Apply PCA for better clustering (optional)
+    pca = PCA(n_components=min(50, embeddings.shape[1]))
+    embeddings_pca = pca.fit_transform(embeddings)
+
+    # Final clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_seed)
+    cluster_labels = kmeans.fit_predict(embeddings_pca)
+
+    # Align clusters to ground truth
+    mapping = best_map(y, cluster_labels)
+    aligned_preds = np.array([mapping[c] for c in cluster_labels])
+    final_acc = accuracy_score(y, aligned_preds)
+    final_f1 = f1_score(y, aligned_preds, average='weighted')
+
+    history['final_accuracy'] = final_acc
+    history['final_f1'] = final_f1
+
+    if verbose:
+        print(f'Final Clustering Accuracy: {final_acc:.4f}')
+        print(f'Final Clustering F1 Score: {final_f1:.4f}')
+        print(f'Best Supervised Accuracy: {history["best_accuracy"]:.4f} (Cycle {history["best_cycle"]+1})')
+
+    # Save results
+    if save_best and best_model_state is not None:
+        # Save model
+        model_path = os.path.join(exp_dir, 'best_model.pth')
+        torch.save(best_model_state, model_path)
+
+        # Save history
+        history_path = os.path.join(exp_dir, 'training_history.json')
+        with open(history_path, 'w') as f:
+            # Convert numpy types to Python types for JSON serialization
+            history_json = {}
+            for key, value in history.items():
+                if isinstance(value, np.ndarray):
+                    history_json[key] = value.tolist()
+                elif isinstance(value, (np.float32, np.float64)):
+                    history_json[key] = float(value)
+                elif isinstance(value, (np.int32, np.int64)):
+                    history_json[key] = int(value)
+                else:
+                    history_json[key] = value
+            json.dump(history_json, f, indent=2)
+
+        if verbose:
+            print(f"Best model saved to: {model_path}")
+            print(f"Training history saved to: {history_path}")
+
+    # Plot training curves
+    if plot_loss:
+        plt.figure(figsize=(15, 5))
+
+        # Plot reconstruction loss
+        plt.subplot(1, 3, 1)
+        plt.plot(history['losses'])
+        plt.title('Reconstruction Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+
+        # Plot accuracy over cycles
+        plt.subplot(1, 3, 2)
+        plt.plot(range(1, len(history['cycle_accuracies']) + 1), history['cycle_accuracies'], 'b-o')
+        plt.title('Accuracy per Cycle')
+        plt.xlabel('Cycle')
+        plt.ylabel('Accuracy')
+        plt.grid(True)
+
+        # Plot F1 score over cycles
+        plt.subplot(1, 3, 3)
+        plt.plot(range(1, len(history['cycle_f1_scores']) + 1), history['cycle_f1_scores'], 'r-o')
+        plt.title('F1 Score per Cycle')
+        plt.xlabel('Cycle')
+        plt.ylabel('F1 Score')
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        if save_best:
+            plot_path = os.path.join(exp_dir, 'training_curves.png')
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            if verbose:
+                print(f"Training curves saved to: {plot_path}")
+
+        plt.show()
+
+    # Prepare return dictionary
+    results = {
+        'model': model,
+        'best_classifier': classifier if 'classifier' in locals() else None,
+        'scaler': scaler,
+        'history': history,
+        'experiment_dir': exp_dir,
+        'best_model_path': os.path.join(exp_dir, 'best_model.pth') if save_best else None,
+        'final_embeddings': embeddings,
+        'cluster_labels': cluster_labels,
+        'aligned_predictions': aligned_preds
+    }
+
+    return results
+
+
+def load_best_model(model_path, input_dim, device=None):
+    """
+    Load the best trained model
+
+    Parameters:
+    -----------
+    model_path : str
+        Path to the saved model file
+    input_dim : int
+        Input dimension for the model
+    device : str or None
+        Device to load the model on
+
+    Returns:
+    --------
+    dict : Dictionary containing model, classifier, scaler, and metadata
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Load saved state
+    checkpoint = torch.load(model_path, map_location=device)
+
+    # Reconstruct model
+    hidden_dim = checkpoint['hyperparameters']['hidden_dim']
+    noise_factor = checkpoint['hyperparameters']['noise_factor']
+
+    model = AdversarialAutoencoder(input_dim, hidden_dim, noise_factor)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+
+    # Reconstruct classifier
+    classifier = LinearClassifier(hidden_dim)
+    classifier.load_state_dict(checkpoint['classifier_state_dict'])
+    classifier.to(device)
+    classifier.eval()
+
+    return {
+        'model': model,
+        'classifier': classifier,
+        'scaler': checkpoint['scaler'],
+        'accuracy': checkpoint['accuracy'],
+        'f1_score': checkpoint['f1_score'],
+        'cycle': checkpoint['cycle'],
+        'hyperparameters': checkpoint['hyperparameters']
+    }
+
+
+# Example usage function
+def optimize_hyperparameters(X, y, param_grid, n_trials=10, device=None):
+    """
+    Simple hyperparameter optimization using grid search with random sampling
+
+    Parameters:
+    -----------
+    X, y : array-like
+        Data and labels
+    param_grid : dict
+        Dictionary of hyperparameters to try
+    n_trials : int
+        Number of random trials
+    device : str or None
+        Device to use
+
+    Returns:
+    --------
+    dict : Best parameters and results
+    """
+    from itertools import product
+    import random
+
+    # Generate all combinations
+    keys, values = zip(*param_grid.items())
+    combinations = list(product(*values))
+
+    # Sample random combinations
+    selected_combinations = random.sample(combinations, min(n_trials, len(combinations)))
+
+    best_acc = 0
+    best_params = None
+    best_results = None
+
+    for i, params in enumerate(selected_combinations):
+        param_dict = dict(zip(keys, params))
+
+        print(f"\nTrial {i+1}/{len(selected_combinations)}")
+        print(f"Parameters: {param_dict}")
+
+        # Run training with current parameters
+        results = train_kan_autoencoder(
+            X, y,
+            **param_dict,
+            device=device,
+            verbose=False,
+            save_best=False,
+            plot_loss=False
+        )
+
+        acc = results['history']['best_accuracy']
+        print(f"Best accuracy: {acc:.4f}")
+
+        if acc > best_acc:
+            best_acc = acc
+            best_params = param_dict
+            best_results = results
+
+    print(f"\nBest parameters: {best_params}")
+    print(f"Best accuracy: {best_acc:.4f}")
+
+    return {
+        'best_params': best_params,
+        'best_accuracy': best_acc,
+        'best_results': best_results
+    }
